@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -166,7 +167,9 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(page.status_code, 200)
                 self.assertIn("Prompt Lamp", page.text)
                 self.assertIn('id="page-reset"', home.text)
-                self.assertLess(home.text.find('id="page-reset"'), home.text.find("<h1>Product Search Results"))
+                self.assertIn('id="page-run"', home.text)
+                self.assertLess(home.text.find('id="page-reset"'), home.text.find('id="page-run"'))
+                self.assertLess(home.text.find('id="page-run"'), home.text.find("<h1>Product Search Results"))
                 self.assertIn('name="prompt"', home.text)
                 self.assertIn('action="/search"', home.text)
                 self.assertIn("Decision Engine by Jev API (Only) :", home.text)
@@ -177,6 +180,103 @@ class ServerTests(unittest.TestCase):
                     home.text.find("Product Search by OpenAI API (Only)"),
                     home.text.find("Decision Engine by Jev API (Only)"),
                 )
+                self.assertIn("<h1>ZooWork Agent Caller</h1>", home.text)
+                self.assertIn("(To Stripe MPP Agent for Purchase Order):", home.text)
+                self.assertIn('id="zoowork-product"', home.text)
+                self.assertIn(">Call agent<", home.text)
+                self.assertIn("Sending Purchase order to MPP Agent with Payment...", home.text)
+                self.assertIn('id="stripe-order"', home.text)
+                self.assertIn("stripe-order').hidden = false", home.text)
+                self.assertLess(
+                    home.text.find("Decision Engine by Jev API (Only)"),
+                    home.text.find("<h1>ZooWork Agent Caller</h1>"),
+                )
+                self.assertIn("<h1>Tavily Agent Caller :</h1>", home.text)
+                self.assertIn('id="tavily-product"', home.text)
+                self.assertLess(
+                    home.text.find("<h1>ZooWork Agent Caller</h1>"),
+                    home.text.find("<h1>Tavily Agent Caller :</h1>"),
+                )
+                script = home.text[home.text.find("<script>") :]
+                reset_block = script[script.find("page-reset") : script.find("url-add")]
+                self.assertIn("zoowork-result", reset_block)
+                self.assertNotIn("runPending", reset_block)
+
+
+    def test_run_crawls_urls_that_have_no_uuid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            urls = root / "urls.txt"
+            done = "11111111-1111-1111-1111-111111111111"
+            new_id = "22222222-2222-2222-2222-222222222222"
+            urls.write_text(
+                f"https://example.com/done {done}\nhttps://example.com/new\n",
+                encoding="utf-8",
+            )
+            app = create_app(root / "products.duckdb", root / "output", urls)
+
+            def fake_crawl(url: str, output_root: Path | None = None) -> Path:
+                self.assertEqual(url, "https://example.com/new")
+                folder = Path(output_root or root / "output") / new_id
+                folder.mkdir(parents=True)
+                (folder / "product.json").write_text(
+                    json.dumps(
+                        {
+                            "requested_url": url,
+                            "title": "New Boot",
+                            "run_id": new_id,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return folder
+
+            with patch("product_crawler.server.crawl", fake_crawl), patch(
+                "product_crawler.server.publish_catalog"
+            ) as band:
+                with TestClient(app) as client:
+                    first = client.post("/urls/run")
+                    second = client.post("/urls/run")
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(first.json()["added"], [{"id": new_id, "name": "New Boot"}])
+            self.assertEqual(first.json()["errors"], [])
+            self.assertIn(f"https://example.com/new {new_id}", urls.read_text(encoding="utf-8"))
+            self.assertIn(done, urls.read_text(encoding="utf-8"))
+            self.assertEqual(second.status_code, 200)
+            self.assertEqual(second.json()["added"], [])
+            self.assertEqual(second.json()["errors"], [])
+            band.assert_called_once()
+
+    def test_add_url_appends_an_unprocessed_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            urls = root / "urls.txt"
+            done = "11111111-1111-1111-1111-111111111111"
+            urls.write_text(f"https://example.com/done {done}\n", encoding="utf-8")
+            app = create_app(root / "products.duckdb", root / "output", urls)
+            with TestClient(app) as client:
+                home = client.get("/")
+                self.assertIn('id="new-url"', home.text)
+                self.assertIn(">Add URL<", home.text)
+                script = home.text.split("<script>", 1)[1]
+                reset_block = script[script.find("page-reset") : script.find("url-add")]
+                add_block = script[script.find("url-add") : script.find("function addResult")]
+                self.assertNotIn("runPending", reset_block)
+                self.assertNotIn("runPending", add_block)
+                self.assertIn("Hit Run to process it.", home.text)
+                self.assertIn("page-run').addEventListener('click', () => { runPending(); })", home.text)
+                added = client.post("/urls/add", json={"url": " https://example.com/new "})
+                duplicate = client.post("/urls/add", json={"url": "https://example.com/done"})
+                invalid = client.post("/urls/add", json={"url": "not a url"})
+            self.assertEqual(added.status_code, 200)
+            self.assertEqual(added.json()["status"], "added")
+            self.assertEqual(
+                urls.read_text(encoding="utf-8"),
+                f"https://example.com/done {done}\nhttps://example.com/new\n",
+            )
+            self.assertEqual(duplicate.status_code, 200)
+            self.assertEqual(duplicate.json()["status"], "processed")
+            self.assertEqual(invalid.status_code, 400)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,11 @@ import httpx
 
 JEV_URL = "https://openrouter.ai/api/alpha/decisions"
 JEV_MODEL = "typesafe/jev-1.13"
+SCORE_LEVELS = (
+    "Does not match the question",
+    "Partly matches the question",
+    "Clearly matches the question",
+)
 
 
 def load_openrouter_key() -> str | None:
@@ -27,7 +32,7 @@ def load_openrouter_key() -> str | None:
 
 
 def ask_jev(products: list[dict[str, Any]], question: str, api_key: str) -> dict[str, Any]:
-    """Ask Jev to pick one checked product for the typed question."""
+    """Ask Jev for a Choice, a Noul, and a Score on the typed question."""
     response = httpx.post(
         JEV_URL,
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -59,7 +64,20 @@ def decision_request(products: list[dict[str, Any]], question: str) -> dict[str,
                     str(product["id"]): _product_label(product)
                     for product in products
                 },
-            }
+            },
+            "noul": {
+                "type": "noul",
+                "instructions": text,
+                "criteria": {
+                    "true": "Yes. The checked products satisfy this question.",
+                    "false": "No. The checked products do not satisfy this question.",
+                },
+            },
+            "score": {
+                "type": "score",
+                "instructions": text,
+                "criteria": list(SCORE_LEVELS),
+            },
         },
     }
 
@@ -89,7 +107,46 @@ def read_decision(payload: dict[str, Any], products: list[dict[str, Any]]) -> di
         "product_name": names.get(choice_id),
         "confidence": float(confidence) if isinstance(confidence, (int, float)) else None,
         "probabilities": probabilities,
+        "noul": _read_noul(answers),
+        "score": _read_score(answers),
         "model": payload.get("model"),
+    }
+
+
+def _read_noul(answers: dict[str, Any]) -> float:
+    answer = answers.get("noul") if isinstance(answers, dict) else None
+    value = answer.get("noul") if isinstance(answer, dict) else None
+    if not isinstance(value, (int, float)):
+        raise RuntimeError("Jev did not return a noul")
+    return float(value)
+
+
+def _read_score(answers: dict[str, Any]) -> dict[str, Any]:
+    answer = answers.get("score") if isinstance(answers, dict) else None
+    position = answer.get("score") if isinstance(answer, dict) else None
+    if not isinstance(position, (int, float)):
+        raise RuntimeError("Jev did not return a score")
+    raw = answer.get("probabilities") if isinstance(answer.get("probabilities"), dict) else {}
+    legend = answer.get("legend") if isinstance(answer.get("legend"), dict) else {}
+    levels = []
+    for index, description in enumerate(SCORE_LEVELS):
+        key = str(index)
+        raw_probability = raw.get(key)
+        if raw_probability is None:
+            raw_probability = raw.get(index)
+        label = legend.get(key, legend.get(index, description))
+        levels.append(
+            {
+                "level": index,
+                "description": str(label),
+                "probability": float(raw_probability) if isinstance(raw_probability, (int, float)) else 0.0,
+            }
+        )
+    confidence = answer.get("confidence")
+    return {
+        "score": float(position),
+        "confidence": float(confidence) if isinstance(confidence, (int, float)) else None,
+        "levels": levels,
     }
 
 

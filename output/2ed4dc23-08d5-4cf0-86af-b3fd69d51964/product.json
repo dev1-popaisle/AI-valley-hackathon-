@@ -1,0 +1,105 @@
+{
+  "requested_url": "https://www.target.com/p/modern-faux-leather-accent-armchair-for-living-room-high-back-reading-chair-soft-padded-sofa-chair-for-bedroom-home-office-apartment-dorm-room/-/A-1013116248#lnk=sametab",
+  "title": "Modern Faux Leather Accent Armchair for Living Room,High Back Reading Chair,Soft Padded Sofa Chair for Bedroom,Home Office,Apartment,Dorm Room",
+  "brand": "ModernLuxe",
+  "product_id": null,
+  "handle": null,
+  "product_type": null,
+  "requested_variant_id": null,
+  "variant_selection": "none",
+  "selected_variant": null,
+  "price": null,
+  "compare_at_price": null,
+  "currency": null,
+  "on_sale": false,
+  "availability": null,
+  "sku": null,
+  "barcode": "198573715831",
+  "description": {
+    "text": null,
+    "html": null
+  },
+  "features": [],
+  "description_points": [],
+  "dimensions": {
+    "heel_to_toe_drop": null,
+    "length": null,
+    "width": null,
+    "height": null,
+    "widths_available": null,
+    "shoe_width": null
+  },
+  "specs": {},
+  "spec_icons": [],
+  "materials": [],
+  "weight": null,
+  "ranking": null,
+  "popularity": null,
+  "star_rating": null,
+  "review_count": null,
+  "rating_count": null,
+  "rating": null,
+  "reviews": [
+    {
+      "nickname": "gwennypoo",
+      "created_at": "2024-08-01",
+      "rating": 5,
+      "headline": null,
+      "comments": "Amazing quality especially for the price… buying 2 more 😉",
+      "source": "openai"
+    }
+  ],
+  "reviews_note": null,
+  "breadcrumbs": [],
+  "options": [],
+  "attributes_from_tags": {},
+  "tags": [],
+  "variants": [],
+  "images": [
+    {
+      "position": 1,
+      "src": "https://target.scene7.com/is/image/Target/GUEST_9dd6eda4-aac0-49c5-ad9e-d8c229edb348",
+      "alt": null,
+      "width": null,
+      "height": null
+    }
+  ],
+  "published_at": null,
+  "created_at": null,
+  "sources": {
+    "product_page": "https://www.target.com/p/modern-faux-leather-accent-armchair-for-living-room-high-back-reading-chair-soft-padded-sofa-chair-for-bedroom-home-office-apartment-dorm-room/-/A-1013116248#lnk=sametab",
+    "product_js": null,
+    "reviews": null
+  },
+  "fetch_method": "httpx",
+  "run_id": "2ed4dc23-08d5-4cf0-86af-b3fd69d51964",
+  "image_count": 1,
+  "barcode_from_openai": true,
+  "research": {
+    "audience_gender": "both",
+    "popularity": "both",
+    "age_group": "adults",
+    "professionals": "Unknown",
+    "demographic_appeal": "Unknown",
+    "top_us_state": "Unknown",
+    "top_us_city": "Unknown",
+    "health_benefits": "Unknown",
+    "average_price": "$214.99",
+    "bundle": "Unknown",
+    "recalls": "none found",
+    "sources": [
+      "https://www.target.com/p/-/A-1006591831",
+      "https://www.target.com/p/-/A-1006591832"
+    ]
+  },
+  "openai_enrichment": {
+    "status": "completed",
+    "missing": [
+      "brand",
+      "barcode",
+      "user feedback"
+    ]
+  },
+  "videos": [],
+  "videos_note": "No related video found."
+}

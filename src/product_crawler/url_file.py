@@ -70,26 +70,59 @@ def save(path: Path, fmt: str, entries: list[Entry]) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def run_file(path: Path, crawl_fn: Callable[[str], Path]) -> int:
+def add_url(path: Path, url: str) -> str:
+    """Append a URL with no UUID so a later scan can crawl it.
+
+    Returns ``added``, ``pending`` when the URL is already waiting, or
+    ``processed`` when the line already has a UUID.
+    """
+    text = url.strip()
+    if not _http_url(text):
+        raise UrlFileError("URL must be an absolute http or https URL")
+    if path.is_file():
+        fmt, entries = load(path)
+    else:
+        fmt = "json" if path.suffix.lower() == ".json" else "text"
+        entries = []
+    for entry in entries:
+        if entry.kind == "job" and entry.url == text:
+            return "processed" if entry.folder else "pending"
+    entries.append(Entry("job", url=text))
+    save(path, fmt, entries)
+    return "added"
+
+
+def crawl_pending(path: Path, crawl_fn: Callable[[str], Path]) -> tuple[list[Path], list[str]]:
+    """Crawl URL lines that do not already have a UUID, and write each UUID back."""
     fmt, entries = load(path)
     _validate(entries, path, fmt)
-    failures = 0
+    added: list[Path] = []
+    errors: list[str] = []
     for entry in entries:
         if entry.kind != "job" or entry.folder:
             continue
         assert entry.url is not None
         try:
-            out_dir = crawl_fn(entry.url)
+            out_dir = Path(crawl_fn(entry.url))
         except CrawlerError as exc:
-            print(f"error: {entry.url}: {exc}", file=sys.stderr)
-            failures += 1
+            errors.append(f"{entry.url}: {exc}")
             continue
-        entry.folder = Path(out_dir).name
+        entry.folder = out_dir.name
         save(path, fmt, entries)
+        added.append(out_dir)
+    return added, errors
+
+
+def run_file(path: Path, crawl_fn: Callable[[str], Path]) -> int:
+    added, errors = crawl_pending(path, crawl_fn)
+    failures = len(errors)
+    for message in errors:
+        print(f"error: {message}", file=sys.stderr)
+    for out_dir in added:
         try:
             from product_crawler.store import publish_output
 
-            publish_output(Path(out_dir))
+            publish_output(out_dir)
         except Exception as exc:
             print(
                 f"error: saved {out_dir} but did not store it in the database: {exc}",

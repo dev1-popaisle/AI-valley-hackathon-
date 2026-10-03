@@ -18,6 +18,7 @@ dependencies = [
   "playwright>=1.48.0",
   "scrapy>=2.11.0",
   "uvicorn>=0.32.0",
+  "zoowork>=0.5.2",
 ]
 
 [project.scripts]

@@ -7,6 +7,7 @@ one image, the product name, and the market barcode stored in DuckDB.
 from __future__ import annotations
 
 import html
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -17,8 +18,20 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
+from product_crawler.band_agent import (
+    ensure_catalog_room,
+    publish_catalog,
+    publish_jev,
+    publish_tavily,
+    publish_zoowork,
+)
+from product_crawler.crawl import crawl
 from product_crawler.jev import ask_jev, load_openrouter_key
+from product_crawler.jev_insight import explain_decision
 from product_crawler.prompt_search import create_from_prompt
+from product_crawler.tavily_search import search_product
+from product_crawler.url_file import UrlFileError, add_url, crawl_pending
+from product_crawler.zoowork_agent import ask_product
 from product_crawler.store import (
     UUID_RE,
     ProductStore,
@@ -28,6 +41,7 @@ from product_crawler.store import (
 
 HOST = "127.0.0.1"
 PORT = 8888
+_RUN_LOCK = threading.Lock()
 
 
 class ProductCreate(BaseModel):
@@ -46,12 +60,26 @@ class JevQuestion(BaseModel):
     question: str
 
 
+class UrlAdd(BaseModel):
+    url: str
+
+
+class ZooWorkAsk(BaseModel):
+    id: str
+
+
+class TavilySearch(BaseModel):
+    id: str
+
+
 def create_app(
     db_path: Path | None = None,
     output_root: Path | None = None,
+    urls_path: Path | None = None,
 ) -> FastAPI:
     store = ProductStore(db_path or default_db_path())
     root = output_root or default_output_root()
+    urls_file = urls_path or _default_urls_path()
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -62,6 +90,7 @@ def create_app(
     app = FastAPI(title="Product pages", lifespan=lifespan)
     app.state.store = store
     app.state.output_root = root
+    app.state.urls_path = urls_file
 
     @app.get("/", response_class=HTMLResponse)
     def index(search_error: str | None = None) -> str:
@@ -78,6 +107,46 @@ def create_app(
         except Exception:
             return RedirectResponse("/?search_error=1", status_code=303)
         return RedirectResponse("/", status_code=303)
+
+    @app.post("/urls/add")
+    def add_product_url(body: UrlAdd) -> dict[str, str]:
+        if not _RUN_LOCK.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="A crawl is already running.")
+        try:
+            try:
+                status = add_url(urls_file, body.url)
+            except UrlFileError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return {"status": status, "url": body.url.strip()}
+        finally:
+            _RUN_LOCK.release()
+
+    @app.post("/urls/run")
+    def run_urls() -> dict[str, Any]:
+        if not _RUN_LOCK.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="A crawl is already running.")
+        try:
+            if not urls_file.is_file():
+                raise HTTPException(status_code=404, detail="urls.txt was not found.")
+            try:
+                folders, errors = crawl_pending(urls_file, lambda url: crawl(url, root))
+            except UrlFileError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            added: list[dict[str, str]] = []
+            stored: list[dict[str, Any]] = []
+            for folder in folders:
+                try:
+                    row = store.import_folder(folder)
+                except Exception as exc:
+                    errors.append(f"{folder.name}: saved the page but did not store it: {exc}")
+                    continue
+                stored.append(row)
+                added.append({"id": row["id"], "name": row["name"] or row["id"]})
+            if stored:
+                _tell_band(lambda: publish_catalog(stored))
+            return {"added": added, "errors": errors}
+        finally:
+            _RUN_LOCK.release()
 
     @app.post("/jev/decide")
     def jev_decide(body: JevQuestion) -> dict[str, Any]:
@@ -99,9 +168,41 @@ def create_app(
                 raise HTTPException(status_code=404, detail="product not found")
             products.append(row)
         try:
-            return ask_jev(products, question, api_key)
+            decision = ask_jev(products, question, api_key)
         except RuntimeError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
+        try:
+            decision["insight"] = explain_decision(question, decision)
+        except RuntimeError as exc:
+            decision["insight"] = str(exc)
+        _tell_band(lambda: publish_jev(question, products, decision))
+        return decision
+
+    @app.post("/zoowork/ask")
+    async def zoowork_ask(body: ZooWorkAsk) -> dict[str, str]:
+        _require_uuid(body.id)
+        row = store.get(body.id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="product not found")
+        try:
+            answer = await ask_product(row)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        _tell_band(lambda: publish_zoowork(row, answer))
+        return {"answer": answer}
+
+    @app.post("/tavily/search")
+    def tavily_search(body: TavilySearch) -> dict[str, Any]:
+        _require_uuid(body.id)
+        row = store.get(body.id)
+        if row is None:
+            raise HTTPException(status_code=404, detail="product not found")
+        try:
+            result = search_product(row)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        _tell_band(lambda: publish_tavily(row, result))
+        return result
 
     @app.get("/api/products")
     def list_products() -> list[dict[str, Any]]:
@@ -178,9 +279,42 @@ def create_app(
 
 
 def main() -> None:
+    import threading
+
     import uvicorn
 
-    uvicorn.run(create_app(), host=HOST, port=PORT)
+    from product_crawler.store import ProductStore, default_db_path
+
+    app = create_app()
+
+    def watch_catalog() -> None:
+        try:
+            store = ProductStore(default_db_path())
+            store.init()
+            ensure_catalog_room()
+            publish_catalog(store.list_products())
+        except Exception as exc:
+            print(f"Band catalog watch was not posted: {exc}", flush=True)
+
+    threading.Thread(target=watch_catalog, name="band-catalog-watch", daemon=True).start()
+    uvicorn.run(app, host=HOST, port=PORT)
+
+
+def _tell_band(action) -> None:
+    try:
+        action()
+    except Exception as exc:
+        print(f"Band review was not posted: {exc}", flush=True)
+
+
+def _product_options(products: list[dict[str, Any]]) -> str:
+    options = ['<option value="">Choose a catalog product</option>']
+    for item in products:
+        label = str(item.get("name") or item["id"])
+        options.append(
+            f'<option value="{html.escape(item["id"], quote=True)}">{html.escape(label)}</option>'
+        )
+    return "".join(options)
 
 
 def _index_html(products: list[dict[str, Any]], *, search_error: str | None) -> str:
@@ -193,11 +327,20 @@ def _index_html(products: list[dict[str, Any]], *, search_error: str | None) -> 
     if search_error:
         error = '<p class="search-error">OpenAI search did not return a product. Try a more specific description.</p>'
     return (
+        '<p class="page-actions">'
         '<button type="button" id="page-reset">Reset</button>'
+        '<button type="button" id="page-run">Run</button>'
+        "</p>"
+        '<form id="url-add" class="url-add">'
+        '<label for="new-url">New URL</label>'
+        '<input id="new-url" type="text" placeholder="https://example.com/product" autocomplete="off">'
+        '<button type="submit">Add URL</button>'
+        "</form>"
+        '<p id="run-status" class="run-status"></p>'
         "<h1>Product Search Results : </h1>"
         '<p class="index-note">Product search is performed by the built-in Crawler engine that scrapes the internet and then uses OpenAI APIs to complete the missing required data as well as additional searching on the product.</p>'
         '<p class="index-note index-note-arrow">An arrow (→) on a result means that page was generated from the text entered in the prompt. OpenAI API calls performed the search. The built-in Crawler was not used.</p>'
-        f"<ul>{items}</ul>"
+        f'<ul id="product-results">{items}</ul>'
         '<section class="openai-section">'
         "<h1>Product Search by OpenAI API (Only) : </h1>"
         f"{error}"
@@ -209,15 +352,52 @@ def _index_html(products: list[dict[str, Any]], *, search_error: str | None) -> 
         "</section>"
         '<section id="jev-section" class="openai-section">'
         "<h1>Decision Engine by Jev API (Only) : </h1>"
-        '<p class="index-note">Check the products that are the options. Jev picks one of them for the question below, using each product page and the information stored for it.</p>'
+        '<p class="index-note">Check the products that are the options. Decide asks Jev for a Choice, a Noul, and a Score on the question below, using each product page and the information stored for it.</p>'
         '<ul id="jev-selected"><li class="jev-empty">No products selected.</li></ul>'
         '<form id="jev-form" class="index-form">'
         '<label for="jev-question">Question</label>'
-        '<textarea id="jev-question" maxlength="2000" placeholder="Question Jev answers by picking one checked product"></textarea>'
+        '<textarea id="jev-question" maxlength="2000" placeholder="Question for the Choice, Noul, and Score"></textarea>'
         '<button type="submit">Decide</button>'
         "</form>"
         '<div id="jev-decision" class="jev-decision"></div>'
         "</section>"
+        '<section id="zoowork-section" class="openai-section">'
+        "<h1>ZooWork Agent Caller</h1>"
+        '<p class="section-subtitle">(To Stripe MPP Agent for Purchase Order):</p>'
+        '<p class="index-note">Pick a catalog product. ZooWork searches the public web and shows what it finds.</p>'
+        '<form id="zoowork-form" class="index-form">'
+        '<label for="zoowork-product">Catalog product</label>'
+        f'<select id="zoowork-product">{_product_options(products)}</select>'
+        '<button type="submit">Call agent</button>'
+        "</form>"
+        '<div id="zoowork-result" class="jev-decision"></div>'
+        "</section>"
+        '<section id="tavily-section" class="openai-section">'
+        "<h1>Tavily Agent Caller :</h1>"
+        '<p class="index-note">Pick a catalog product. Tavily searches the public web and shows the result as structured JSON.</p>'
+        '<form id="tavily-form" class="index-form">'
+        '<label for="tavily-product">Catalog product</label>'
+        f'<select id="tavily-product">{_product_options(products)}</select>'
+        '<button type="submit">Search</button>'
+        "</form>"
+        '<div id="tavily-result" class="tavily-result"></div>'
+        "</section>"
+        '<div id="stripe-order" class="stripe-order" hidden>'
+        '<div class="stripe-order-card" role="dialog" aria-modal="true" aria-labelledby="stripe-order-message">'
+        '<svg class="stripe-logo" viewBox="54 36 360.02 149.84" role="img" aria-label="Stripe">'
+        '<g fill="#635BFF" fill-rule="evenodd" clip-rule="evenodd">'
+        '<path d="M414,113.4c0-25.6-12.4-45.8-36.1-45.8c-23.8,0-38.2,20.2-38.2,45.6c0,30.1,17,45.3,41.4,45.3c11.9,0,20.9-2.7,27.7-6.5v-20c-6.8,3.4-14.6,5.5-24.5,5.5c-9.7,0-18.3-3.4-19.4-15.2h48.9C413.8,121,414,115.8,414,113.4z M364.6,103.9c0-11.3,6.9-16,13.2-16c6.1,0,12.6,4.7,12.6,16H364.6z"/>'
+        '<path d="M301.1,67.6c-9.8,0-16.1,4.6-19.6,7.8l-1.3-6.2h-22v116.6l25-5.3l0.1-28.3c3.6,2.6,8.9,6.3,17.7,6.3c17.9,0,34.2-14.4,34.2-46.1C335.1,83.4,318.6,67.6,301.1,67.6z M295.1,136.5c-5.9,0-9.4-2.1-11.8-4.7l-0.1-37.1c2.6-2.9,6.2-4.9,11.9-4.9c9.1,0,15.4,10.2,15.4,23.3C310.5,126.5,304.3,136.5,295.1,136.5z"/>'
+        '<polygon points="223.8,61.7 248.9,56.3 248.9,36 223.8,41.3"/>'
+        '<rect x="223.8" y="69.3" width="25.1" height="87.5"/>'
+        '<path d="M196.9,76.7l-1.6-7.4h-21.6v87.5h25V97.5c5.9-7.7,15.9-6.3,19-5.2v-23C214.5,68.1,202.8,65.9,196.9,76.7z"/>'
+        '<path d="M146.9,47.6l-24.4,5.2l-0.1,80.1c0,14.8,11.1,25.7,25.9,25.7c8.2,0,14.2-1.5,17.5-3.3V135c-3.2,1.3-19,5.9-19-8.9V90.6h19V69.3h-19L146.9,47.6z"/>'
+        '<path d="M79.3,94.7c0-3.9,3.2-5.4,8.5-5.4c7.6,0,17.2,2.3,24.8,6.4V72.2c-8.3-3.3-16.5-4.6-24.8-4.6C67.5,67.6,54,78.2,54,95.9c0,27.6,38,23.2,38,35.1c0,4.6-4,6.1-9.6,6.1c-8.3,0-18.9-3.4-27.3-8v23.8c9.3,4,18.7,5.7,27.3,5.7c20.8,0,35.1-10.3,35.1-28.2C117.4,100.6,79.3,105.9,79.3,94.7z"/>'
+        "</g>"
+        "</svg>"
+        '<p id="stripe-order-message">Sending Purchase order to MPP Agent with Payment...</p>'
+        "</div>"
+        "</div>"
         "<script>"
         "const selected = new Map();"
         "const storageKey = 'jev-selected-ids';"
@@ -271,11 +451,274 @@ def _index_html(products: list[dict[str, Any]], *, search_error: str | None) -> 
         "  remember();"
         "  render();"
         "  document.getElementById('prompt').value = '';"
+        "  document.getElementById('new-url').value = '';"
         "  document.getElementById('jev-question').value = '';"
         "  document.getElementById('jev-decision').replaceChildren();"
+        "  document.getElementById('zoowork-product').value = '';"
+        "  document.getElementById('zoowork-result').replaceChildren();"
+        "  document.getElementById('stripe-order').hidden = true;"
+        "  document.getElementById('tavily-product').value = '';"
+        "  document.getElementById('tavily-result').replaceChildren();"
         "  const searchError = document.querySelector('.search-error');"
         "  if (searchError) searchError.remove();"
+        "  const status = document.getElementById('run-status');"
+        "  status.textContent = '';"
+        "  status.className = 'run-status';"
         "});"
+        "document.getElementById('url-add').addEventListener('submit', async (event) => {"
+        "  event.preventDefault();"
+        "  const input = document.getElementById('new-url');"
+        "  const status = document.getElementById('run-status');"
+        "  const url = input.value.trim();"
+        "  if (!url) {"
+        "    status.className = 'run-status run-error';"
+        "    status.textContent = 'Enter a URL.';"
+        "    return;"
+        "  }"
+        "  const response = await fetch('/urls/add', {"
+        "    method: 'POST',"
+        "    headers: { 'Content-Type': 'application/json' },"
+        "    body: JSON.stringify({ url }),"
+        "  });"
+        "  let payload = {};"
+        "  try { payload = await response.json(); } catch (error) { payload = {}; }"
+        "  if (!response.ok) {"
+        "    status.className = 'run-status run-error';"
+        "    status.textContent = payload.detail || 'The URL was not saved.';"
+        "    return;"
+        "  }"
+        "  input.value = '';"
+        "  status.className = 'run-status';"
+        "  if (payload.status === 'processed') {"
+        "    status.textContent = 'That URL is already in urls.txt with a result.';"
+        "    return;"
+        "  }"
+        "  status.textContent = 'Saved to urls.txt. Hit Run to process it.';"
+        "});"
+        "function addResult(product) {"
+        "  const list = document.getElementById('product-results');"
+        "  const first = list.querySelector('li');"
+        "  if (first && !first.querySelector('a')) first.remove();"
+        "  const item = document.createElement('li');"
+        "  const box = document.createElement('input');"
+        "  box.className = 'jev-select';"
+        "  box.type = 'checkbox';"
+        "  box.value = product.id;"
+        "  box.setAttribute('aria-label', 'Use ' + (product.name || product.id) + ' in Jev');"
+        "  box.addEventListener('change', () => { useProduct(box.value, box.checked); });"
+        "  const link = document.createElement('a');"
+        "  link.href = '/' + product.id;"
+        "  link.textContent = product.name || product.id;"
+        "  item.append(box, document.createTextNode(' '), link);"
+        "  list.prepend(item);"
+        "  addCatalogOption('zoowork-product', product);"
+        "  addCatalogOption('tavily-product', product);"
+        "}"
+        "function addCatalogOption(selectId, product) {"
+        "  const menu = document.getElementById(selectId);"
+        "  if (![...menu.options].some((option) => option.value === product.id)) {"
+        "    const option = document.createElement('option');"
+        "    option.value = product.id;"
+        "    option.textContent = product.name || product.id;"
+        "    menu.append(option);"
+        "  }"
+        "}"
+        "function imageSource(item) {"
+        "  if (typeof item === 'string') return item;"
+        "  if (item && typeof item.url === 'string') return item.url;"
+        "  return '';"
+        "}"
+        "function productImage(payload) {"
+        "  const lists = [payload && payload.images];"
+        "  (payload && payload.results || []).forEach((item) => lists.push(item && item.images));"
+        "  for (const list of lists) {"
+        "    if (!Array.isArray(list)) continue;"
+        "    for (const item of list) {"
+        "      const src = imageSource(item);"
+        "      if (/^https?:\\/\\//.test(src)) return { src: src, alt: (item && item.description) || 'Product image' };"
+        "    }"
+        "  }"
+        "  return null;"
+        "}"
+        "function renderJson(value, parent, key) {"
+        "  if (key === 'images' && Array.isArray(value)) {"
+        "    const count = value.filter((item) => /^https?:\\/\\//.test(imageSource(item))).length;"
+        "    parent.textContent = count ? String(count) + (count === 1 ? ' image' : ' images') : '[]';"
+        "    return;"
+        "  }"
+        "  if (Array.isArray(value)) {"
+        "    if (!value.length) { parent.textContent = '[]'; return; }"
+        "    value.forEach((item, index) => {"
+        "      const card = document.createElement('section');"
+        "      card.className = 'json-card';"
+        "      const heading = document.createElement('h3');"
+        "      heading.textContent = String(index + 1);"
+        "      card.append(heading);"
+        "      renderJson(item, card);"
+        "      parent.append(card);"
+        "    });"
+        "    return;"
+        "  }"
+        "  if (value && typeof value === 'object') {"
+        "    const fields = document.createElement('dl');"
+        "    fields.className = 'json-fields';"
+        "    Object.keys(value).forEach((field) => {"
+        "      const term = document.createElement('dt');"
+        "      term.textContent = field;"
+        "      const detail = document.createElement('dd');"
+        "      renderJson(value[field], detail, field);"
+        "      fields.append(term, detail);"
+        "    });"
+        "    parent.append(fields);"
+        "    return;"
+        "  }"
+        "  if (typeof value === 'string' && /^https?:\\/\\//.test(value)) {"
+        "    const link = document.createElement('a');"
+        "    link.href = value;"
+        "    link.textContent = value;"
+        "    link.target = '_blank';"
+        "    link.rel = 'noopener';"
+        "    parent.append(link);"
+        "    return;"
+        "  }"
+        "  parent.textContent = value === null || value === undefined ? 'null' : String(value);"
+        "}"
+        "document.getElementById('tavily-form').addEventListener('submit', async (event) => {"
+        "  event.preventDefault();"
+        "  const menu = document.getElementById('tavily-product');"
+        "  const out = document.getElementById('tavily-result');"
+        "  const button = event.currentTarget.querySelector('button');"
+        "  out.replaceChildren();"
+        "  if (!menu.value) {"
+        "    const note = document.createElement('p');"
+        "    note.className = 'run-error';"
+        "    note.textContent = 'Choose a catalog product.';"
+        "    out.append(note);"
+        "    return;"
+        "  }"
+        "  button.disabled = true;"
+        "  const waiting = document.createElement('p');"
+        "  waiting.textContent = 'Searching…';"
+        "  out.append(waiting);"
+        "  try {"
+        "    const response = await fetch('/tavily/search', {"
+        "      method: 'POST',"
+        "      headers: { 'Content-Type': 'application/json' },"
+        "      body: JSON.stringify({ id: menu.value })"
+        "    });"
+        "    const payload = await response.json();"
+        "    out.replaceChildren();"
+        "    if (!response.ok) {"
+        "      const note = document.createElement('p');"
+        "      note.className = 'run-error';"
+        "      note.textContent = payload.detail || 'Tavily search failed.';"
+        "      out.append(note);"
+        "      return;"
+        "    }"
+        "    const sample = productImage(payload);"
+        "    if (sample) {"
+        "      const img = document.createElement('img');"
+        "      img.className = 'tavily-sample';"
+        "      img.src = sample.src;"
+        "      img.alt = sample.alt;"
+        "      img.referrerPolicy = 'no-referrer';"
+        "      out.append(img);"
+        "    }"
+        "    renderJson(payload, out);"
+        "  } catch (error) {"
+        "    out.replaceChildren();"
+        "    const note = document.createElement('p');"
+        "    note.className = 'run-error';"
+        "    note.textContent = 'Tavily search failed.';"
+        "    out.append(note);"
+        "  } finally {"
+        "    button.disabled = false;"
+        "  }"
+        "});"
+        "document.getElementById('zoowork-form').addEventListener('submit', async (event) => {"
+        "  event.preventDefault();"
+        "  const menu = document.getElementById('zoowork-product');"
+        "  const out = document.getElementById('zoowork-result');"
+        "  const button = event.currentTarget.querySelector('button');"
+        "  out.replaceChildren();"
+        "  if (!menu.value) {"
+        "    const note = document.createElement('p');"
+        "    note.className = 'run-error';"
+        "    note.textContent = 'Choose a catalog product.';"
+        "    out.append(note);"
+        "    return;"
+        "  }"
+        "  button.disabled = true;"
+        "  document.getElementById('stripe-order').hidden = false;"
+        "  const waiting = document.createElement('p');"
+        "  waiting.textContent = 'Searching the web…';"
+        "  out.append(waiting);"
+        "  try {"
+        "    const response = await fetch('/zoowork/ask', {"
+        "      method: 'POST',"
+        "      headers: { 'Content-Type': 'application/json' },"
+        "      body: JSON.stringify({ id: menu.value })"
+        "    });"
+        "    const payload = await response.json();"
+        "    out.replaceChildren();"
+        "    if (!response.ok) {"
+        "      const note = document.createElement('p');"
+        "      note.className = 'run-error';"
+        "      note.textContent = payload.detail || 'ZooWork search failed.';"
+        "      out.append(note);"
+        "      return;"
+        "    }"
+        "    String(payload.answer || '').split(/\\n\\s*\\n/).forEach((paragraph) => {"
+        "      const text = paragraph.trim();"
+        "      if (!text) return;"
+        "      const block = document.createElement('p');"
+        "      block.className = 'jev-insight';"
+        "      block.textContent = text;"
+        "      out.append(block);"
+        "    });"
+        "  } catch (error) {"
+        "    out.replaceChildren();"
+        "    const note = document.createElement('p');"
+        "    note.className = 'run-error';"
+        "    note.textContent = 'ZooWork search failed.';"
+        "    out.append(note);"
+        "  } finally {"
+        "    button.disabled = false;"
+        "    document.getElementById('stripe-order').hidden = true;"
+        "  }"
+        "});"
+        "document.getElementById('page-run').addEventListener('click', () => { runPending(); });"
+        "function setCrawlBusy(busy) {"
+        "  document.getElementById('page-run').disabled = busy;"
+        "  document.querySelector('#url-add button').disabled = busy;"
+        "}"
+        "async function runPending() {"
+        "  const status = document.getElementById('run-status');"
+        "  setCrawlBusy(true);"
+        "  status.className = 'run-status';"
+        "  status.textContent = 'Running…';"
+        "  const response = await fetch('/urls/run', { method: 'POST' });"
+        "  let payload = {};"
+        "  try { payload = await response.json(); } catch (error) { payload = {}; }"
+        "  setCrawlBusy(false);"
+        "  if (!response.ok) {"
+        "    status.className = 'run-status run-error';"
+        "    status.textContent = payload.detail || 'The crawl did not finish.';"
+        "    return;"
+        "  }"
+        "  const added = payload.added || [];"
+        "  const errors = payload.errors || [];"
+        "  for (const product of added) addResult(product);"
+        "  if (!added.length && !errors.length) {"
+        "    status.textContent = 'No unprocessed URLs in urls.txt.';"
+        "    return;"
+        "  }"
+        "  const lines = [];"
+        "  if (added.length) lines.push('Added ' + added.length + (added.length === 1 ? ' product.' : ' products.'));"
+        "  for (const message of errors) lines.push(message);"
+        "  status.className = errors.length ? 'run-status run-error' : 'run-status';"
+        "  status.textContent = lines.join(' ');"
+        "}"
         "function showDecision(message) {"
         "  const out = document.getElementById('jev-decision');"
         "  out.replaceChildren();"
@@ -307,22 +750,61 @@ def _index_html(products: list[dict[str, Any]], *, search_error: str | None) -> 
         "function choicePercent(value) {"
         "  return Math.round(Number(value) * 100) + '%';"
         "}"
+        "function decisionLine(text) {"
+        "  const row = document.createElement('p');"
+        "  row.textContent = text;"
+        "  return row;"
+        "}"
+        "function decisionHeading(text) {"
+        "  const row = document.createElement('h2');"
+        "  row.textContent = text;"
+        "  return row;"
+        "}"
         "function showChoice(payload) {"
         "  const out = document.getElementById('jev-decision');"
         "  out.replaceChildren();"
-        "  const picked = document.createElement('p');"
-        "  picked.textContent = 'Selected: ' + (payload.product_name || payload.choice);"
-        "  const confidence = document.createElement('p');"
-        "  confidence.textContent = 'Confidence: ' + (payload.confidence == null ? '' : choicePercent(payload.confidence));"
-        "  const label = document.createElement('p');"
-        "  label.textContent = 'Probability for each option';"
+        "  const score = payload.score || {};"
         "  const list = document.createElement('ul');"
         "  for (const option of payload.probabilities || []) {"
         "    const item = document.createElement('li');"
         "    item.textContent = option.name + ' — ' + choicePercent(option.probability);"
         "    list.append(item);"
         "  }"
-        "  out.append(picked, confidence, label, list);"
+        "  const levels = document.createElement('ul');"
+        "  for (const level of score.levels || []) {"
+        "    const item = document.createElement('li');"
+        "    item.textContent = level.description + ' — ' + choicePercent(level.probability);"
+        "    levels.append(item);"
+        "  }"
+        "  const top = (score.levels || []).length ? (score.levels.length - 1) : '';"
+        "  const scoreText = score.score == null ? '' : Number(score.score).toFixed(2) + (top === '' ? '' : ' of ' + top);"
+        "  const no = payload.noul == null ? '' : choicePercent(1 - Number(payload.noul));"
+        "  out.append("
+        "    decisionHeading('Choice'),"
+        "    decisionLine('Selected: ' + (payload.product_name || payload.choice || '')),"
+        "    decisionLine('Confidence: ' + (payload.confidence == null ? '' : choicePercent(payload.confidence))),"
+        "    decisionLine('Probability for each option'),"
+        "    list,"
+        "    decisionHeading('Noul'),"
+        "    decisionLine('Yes: ' + (payload.noul == null ? '' : choicePercent(payload.noul))),"
+        "    decisionLine('No: ' + no),"
+        "    decisionHeading('Score'),"
+        "    decisionLine('Score: ' + scoreText),"
+        "    decisionLine('Confidence: ' + (score.confidence == null ? '' : choicePercent(score.confidence))),"
+        "    decisionLine('Probability for each level'),"
+        "    levels,"
+        "    decisionHeading('LLM (with Jev input) :'),"
+        "    ...insightLines(payload.insight)"
+        "  );"
+        "}"
+        "function insightLines(text) {"
+        "  const lines = String(text || '').split(/\\n+/).map((line) => line.trim()).filter(Boolean);"
+        "  if (!lines.length) lines.push('OpenAI did not return an explanation.');"
+        "  return lines.map((line) => {"
+        "    const row = decisionLine(line);"
+        "    row.className = 'jev-insight';"
+        "    return row;"
+        "  });"
         "}"
         "</script>"
     )
@@ -345,6 +827,14 @@ def _result_item(item: dict[str, Any], *, arrow: bool) -> str:
         f"{marker}"
         "</li>"
     )
+
+
+def _default_urls_path() -> Path:
+    candidates = (Path("urls.txt"), Path(__file__).resolve().parents[2] / "urls.txt")
+    for path in candidates:
+        if path.is_file():
+            return path
+    return candidates[0]
 
 
 def _require_uuid(product_id: str) -> None:
@@ -370,12 +860,20 @@ def _page(title: str, body: str) -> str:
   <title>{html.escape(title)}</title>
   <style>
     body {{ font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 40rem; color: #1c1c1c; }}
-    #page-reset {{ margin: 0 0 1.25rem; font: inherit; padding: 0.35rem 0.8rem; }}
+    .page-actions {{ margin: 0 0 0.6rem; display: flex; gap: 0.6rem; }}
+    .page-actions button, .url-add button {{ font: inherit; padding: 0.35rem 0.8rem; }}
+    .url-add {{ display: flex; gap: 0.6rem; align-items: center; margin: 0 0 0.6rem; }}
+    .url-add label {{ white-space: nowrap; }}
+    .url-add input {{ flex: 1; font: inherit; font-size: 0.95rem; padding: 0.35rem 0.5rem; }}
+    .run-status {{ margin: 0 0 1.25rem; min-height: 1.2rem; }}
+    .run-error {{ color: #8a1f1f; }}
     a {{ color: #0b57d0; }}
     .index-note {{ margin: 0.35rem 0 0.35rem; font-size: 0.85rem; line-height: 1.4; color: #555; }}
     .index-note-arrow {{ margin-bottom: 1.25rem; }}
     .openai-section {{ margin-top: 2.5rem; padding-top: 1.25rem; border-top: 1px solid #ddd; }}
-    .index-form textarea {{ width: 100%; min-height: 6rem; box-sizing: border-box; font: inherit; font-size: 0.95rem; padding: 0.5rem; }}
+    .section-subtitle {{ margin: 0.15rem 0 0.35rem; font-size: 0.95rem; line-height: 1.35; }}
+    .index-form textarea, .index-form select {{ width: 100%; box-sizing: border-box; font: inherit; font-size: 0.95rem; padding: 0.5rem; }}
+    .index-form textarea {{ min-height: 6rem; }}
     .index-form button {{ margin-top: 0.6rem; font: inherit; padding: 0.35rem 0.8rem; }}
     .search-error {{ color: #8a1f1f; font-size: 0.9rem; }}
     .openai-result {{ margin: 0.35rem 0; }}
@@ -386,7 +884,22 @@ def _page(title: str, body: str) -> str:
     .jev-card {{ margin: 0.55rem 0 0.9rem; }}
     .jev-detail {{ margin: 0.15rem 0 0; color: #555; font-size: 0.85rem; word-break: break-all; }}
     .jev-decision {{ margin-top: 1rem; font-size: 1.05rem; }}
+    .jev-decision h2 {{ font-size: 1.05rem; margin: 1rem 0 0.35rem; }}
+    .jev-decision h2:first-child {{ margin-top: 0; }}
     .jev-decision p {{ margin: 0.2rem 0; }}
+    .jev-insight {{ margin: 0.55rem 0; line-height: 1.45; }}
+    .stripe-order {{ position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center; background: rgba(28, 28, 28, 0.35); }}
+    .stripe-order[hidden] {{ display: none; }}
+    .stripe-order-card {{ width: min(16rem, calc(100vw - 2rem)); margin: 0; padding: 1.25rem 1.1rem 1.15rem; background: #fff; border-radius: 10px; box-shadow: 0 10px 28px rgba(0, 0, 0, 0.18); text-align: center; }}
+    .stripe-logo {{ width: 8.5rem; height: auto; }}
+    .stripe-order-card p {{ margin: 0.9rem 0 0; font-size: 0.95rem; line-height: 1.4; }}
+    .tavily-result {{ margin-top: 1rem; }}
+    .tavily-sample {{ width: 120px; height: 120px; object-fit: contain; background: #f3f3f3; border: 1px solid #ddd; border-radius: 6px; display: block; margin: 0 0 0.8rem; }}
+    .json-fields {{ margin: 0.2rem 0 0.4rem; }}
+    .json-fields dt {{ margin-top: 0.7rem; font-size: 0.75rem; letter-spacing: 0.04em; text-transform: uppercase; color: #555; }}
+    .json-fields dd {{ margin: 0.15rem 0 0; line-height: 1.45; overflow-wrap: anywhere; }}
+    .json-card {{ margin: 0.75rem 0; padding: 0.7rem 0.85rem; border: 1px solid #ddd; border-radius: 8px; background: #fafafa; }}
+    .json-card h3 {{ margin: 0; font-size: 0.9rem; }}
     img.product {{ width: 160px; height: 160px; object-fit: contain; background: #f3f3f3; }}
     .field-label {{ margin: 1rem 0 0; color: #555; }}
     .brand {{ font-size: 1.3rem; margin: 0.15rem 0 0; letter-spacing: 0.04em; }}
